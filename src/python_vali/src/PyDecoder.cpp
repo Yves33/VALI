@@ -304,6 +304,30 @@ void PyDecoder::SetMode(DecodeMode new_mode) { upDecoder->SetMode(new_mode); }
 
 DecodeMode PyDecoder::GetMode() const { return upDecoder->GetMode(); }
 
+DECODE_STATUS PyDecoder::ReadPacket() { return upDecoder->ReadPacket(); }
+
+DECODE_STATUS PyDecoder::DecodePacketToSurface(Surface& surf) {
+  if (!IsAccelerated())
+    return DEC_ERROR;
+
+  return upDecoder->DecodePacket(surf);
+}
+
+DECODE_STATUS PyDecoder::DecodePacketToFrame(py::array& frame) {
+  if (IsAccelerated())
+    return DEC_ERROR;
+
+  auto const frame_size = upDecoder->GetHostFrameSize();
+  if (frame_size != frame.nbytes())
+    frame.resize({frame_size}, false);
+
+  auto dst = std::shared_ptr<Buffer>(
+      Buffer::Make(frame.nbytes(), frame.mutable_data()));
+
+  py::gil_scoped_release gil_release{};
+  return upDecoder->DecodePacket(*dst.get());
+}
+
 void Init_PyDecoder(py::module& m) {
   py::class_<PyDecoder, shared_ptr<PyDecoder>>(m, "PyDecoder",
                                                "Video decoder class.")
@@ -525,6 +549,67 @@ void Init_PyDecoder(py::module& m) {
              - success (bool): True if decoding was successful
              - info (TaskExecInfo): Detailed execution information
          :rtype: tuple[bool, TaskExecInfo]
+         :raises RuntimeError: If called without hardware acceleration
+     )pbdoc")
+      .def(
+          "ReadPacket", [](PyDecoder& self) { return self.ReadPacket(); },
+          py::call_guard<py::gil_scoped_release>(),
+          R"pbdoc(
+         Reads single compressed video packet.
+     )pbdoc")
+      .def(
+          "DecodePacketToSurface",
+          [](PyDecoder& self, Surface& surf) {
+            auto ret = self.DecodePacketToSurface(surf);
+            if (DEC_SUCCESS == ret) {
+              self.m_event->Record();
+              self.m_event->Wait();
+            }
+            return ret;
+          },
+          py::arg("surf"), py::call_guard<py::gil_scoped_release>(),
+          R"pbdoc(
+         Decode a single video frame into a CUDA surface.
+
+         This method is for hardware-accelerated decoding.
+         The frame will be decoded directly into the provided CUDA surface.
+
+         :param surf: CUDA surface to store the decoded frame
+         :rtype: DecodeStatus
+         :raises RuntimeError: If called without hardware acceleration
+     )pbdoc")
+      .def(
+          "DecodePacketToSurfaceAsync",
+          [](PyDecoder& self, Surface& surf) {
+            return self.DecodePacketToSurface(surf);
+          },
+          py::arg("surf"), py::call_guard<py::gil_scoped_release>(),
+          R"pbdoc(
+         Decode a single video frame into a CUDA surface.
+
+         This method is for hardware-accelerated decoding.
+         The frame will be decoded directly into the provided CUDA surface,
+         and packet metadata will be stored in pkt_data.
+         The operation is synchronous and will wait for completion.
+
+         :param surf: CUDA surface to store the decoded frame
+         :rtype: DecodeStatus
+         :raises RuntimeError: If called without hardware acceleration
+     )pbdoc")
+      .def(
+          "DecodePacketToFrame",
+          [](PyDecoder& self, py::array& frame) {
+            return self.DecodePacketToFrame(frame);
+          },
+          py::arg("frame"),
+          R"pbdoc(
+         Decode a single video frame from the input source.
+
+         This method is for CPU-only decoding (non-accelerated decoder).
+         The frame will be decoded into the provided numpy array.
+
+         :param frame: Numpy array to store the decoded frame
+         :rtype: DecodeStatus
          :raises RuntimeError: If called without hardware acceleration
      )pbdoc")
       .def(
