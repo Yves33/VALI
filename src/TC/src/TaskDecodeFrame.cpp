@@ -104,12 +104,36 @@ private:
   std::queue<T> m_queue;
   std::mutex m_mutex;
   std::condition_variable m_cv_prod;
-  std::condition_variable m_cv_cons;
   size_t m_capacity;
   std::atomic<bool> m_closed = {false};
+  uint32_t m_timeout = 3000U;
+
+  /* Not thread safe, to be used with m_mutex locked.
+   */
+  bool full() const { return m_queue.size() == m_capacity; }
+  bool empty() const { return m_queue.empty(); }
 
 public:
+  enum class Status { Success = 0, Closed = 1, Empty = 2, Full = 3 };
+
+  static std::string toString(Status status) {
+    switch (status) {
+    case Status::Success:
+      return "Success";
+    case Status::Closed:
+      return "Closed";
+    case Status::Empty:
+      return "Empty";
+    case Status::Full:
+      return "Full";
+    default:
+      return "Unknow";
+    }
+  }
+
   ProducerConsumerQueue(size_t capacity) : m_capacity(capacity) {}
+
+  unsigned int timeout_ms() const { return m_timeout; }
 
   void close() { m_closed = true; }
 
@@ -117,60 +141,73 @@ public:
 
   bool closed() const { return m_closed; }
 
-  bool push(const T& item) {
-    if (closed())
-      return false;
+  Status push(const T& item) {
+    if (closed()) {
+      return Status::Closed;
+    }
     std::unique_lock lock{m_mutex};
-    m_cv_prod.wait(lock, [this] { return m_queue.size() < m_capacity; });
+    if (!m_cv_prod.wait_for(lock, std::chrono::milliseconds(m_timeout),
+                            [this] { return !full(); })) {
+      return Status::Full;
+    }
     m_queue.push(item);
-    m_cv_cons.notify_one();
-    return true;
+    return Status::Success;
   }
 
-  bool pop(T& item) {
-    if (closed())
-      return false;
+  Status pop(T& item) {
+    if (closed()) {
+      return Status::Closed;
+    }
     std::unique_lock lock{m_mutex};
-    if (m_queue.empty())
-      return false;
-    m_cv_cons.wait(lock, [this] { return !m_queue.empty(); });
+    if (empty()) {
+      return Status::Empty;
+    }
     item = m_queue.front();
     m_queue.pop();
     m_cv_prod.notify_one();
 
-    return true;
+    return Status::Success;
   }
 
-  bool pop() {
-    if (closed())
-      return false;
+  Status pop() {
+    if (closed()) {
+      return Status::Closed;
+    }
     std::unique_lock lock{m_mutex};
-    if (m_queue.empty())
-      return false;
-    m_cv_cons.wait(lock, [this] { return !m_queue.empty(); });
+    if (empty()) {
+      return Status::Empty;
+    }
     m_queue.pop();
     m_cv_prod.notify_one();
 
-    return true;
+    return Status::Success;
   }
 
-  std::optional<T> peek() {
-    if (closed())
-      return std::nullopt;
+  Status peek(T& item) {
+    if (closed()) {
+      return Status::Closed;
+    }
     std::unique_lock lock{m_mutex};
-    if (m_queue.empty())
-      return std::nullopt;
-    m_cv_cons.wait(lock, [this] { return !m_queue.empty(); });
-    return std::optional<T>(m_queue.front());
+    if (empty()) {
+      return Status::Empty;
+    }
+    item = m_queue.front();
+    return Status::Success;
   }
+
+  size_t capacity() const { return m_capacity; }
 };
+
+using PacketPtr = std::shared_ptr<AVPacket>;
+using PacketQueue = ProducerConsumerQueue<PacketPtr>;
+using QueueStatus = PacketQueue::Status;
 
 struct FfmpegDecodeFrame_Impl {
   std::shared_ptr<AVFormatContext> m_fmt_ctx;
   std::shared_ptr<SwrContext> m_swr_ctx;
   std::shared_ptr<AVCodecContext> m_avc_ctx;
   std::shared_ptr<AVFrame> m_frame;
-  ProducerConsumerQueue<std::shared_ptr<AVPacket>> m_queue;
+  PacketQueue m_queue;
   std::shared_ptr<AVBufferRef> m_hw_ctx;
   std::map<AVFrameSideDataType, Buffer*> m_side_data;
   std::shared_ptr<AVDictionary> m_options;
@@ -251,21 +288,19 @@ struct FfmpegDecodeFrame_Impl {
     return -1;
   }
 
-  // 24 FPS is a common value, so encoded packet queue size is set to hold
-  // amount of packets enough for ~1s of video.
-  static constexpr auto default_queue_size = 24U;
-
   /// @brief Constructor
   /// @param URL input url
   /// @param ffmpeg_options list of options you would pass to ffmpeg cli
   /// @param gpu_id gpu id, -1 for cpu
+  /// @param pkt_queue_size internal packet queue size
   /// @param p_io_ctx custom IO context
   /// @param probe if true, only video streams information will be collected
   FfmpegDecodeFrame_Impl(const char* URL,
                          std::map<std::string, std::string>& ffmpeg_options,
-                         int gpu_id, std::shared_ptr<AVIOContext> p_io_ctx,
+                         int gpu_id, int pkt_queue_size,
+                         std::shared_ptr<AVIOContext> p_io_ctx,
                          bool probe = false)
-      : m_io_ctx(p_io_ctx), m_queue(default_queue_size) {
+      : m_io_ctx(p_io_ctx), m_queue(pkt_queue_size) {
 
     // Extract preferred width from options because it's not ffmpeg option.
     auto it = ffmpeg_options.find("preferred_width");
@@ -717,7 +752,7 @@ struct FfmpegDecodeFrame_Impl {
     if (m_state.m_cancel)
       return DEC_ERROR;
 
-    auto is_desired_video_packet = [this](std::shared_ptr<AVPacket> pkt) {
+    auto is_desired_video_packet = [this](PacketPtr pkt) {
       auto const is_video = GetVideoStrIdx() == pkt->stream_index;
       auto const is_key = pkt->flags & AV_PKT_FLAG_KEY;
 
@@ -726,7 +761,7 @@ struct FfmpegDecodeFrame_Impl {
     };
 
     while (!m_state.m_over) {
-      auto pkt = std::shared_ptr<AVPacket>(av_packet_alloc(), [](void* p) {
+      auto pkt = PacketPtr(av_packet_alloc(), [](void* p) {
         av_packet_unref((AVPacket*)p);
         av_packet_free((AVPacket**)&p);
       });
@@ -735,10 +770,14 @@ struct FfmpegDecodeFrame_Impl {
       auto ret = av_read_frame(m_fmt_ctx.get(), pkt.get());
 
       if (AVERROR_EOF == ret) {
-        // Put sentinel and signal that no more packets will be put into queue.
-        if (!m_queue.push({}))
-          std::cerr << "Failed to push sentinel: closed queue";
         m_state.m_over = true;
+        const auto status = m_queue.push({});
+        if (QueueStatus::Success != status) {
+          std::cerr << "Failed to push sentinel: "
+                    << PacketQueue::toString(status) << "\n";
+          m_state.m_cancel = true;
+          return DEC_ERROR;
+        }
         break;
       } else if (ret < 0) {
         // Return error but don't change internal state.
@@ -749,8 +788,10 @@ struct FfmpegDecodeFrame_Impl {
 
       m_num_pkt_read++;
       if (is_desired_video_packet(pkt)) {
-        if (!m_queue.push(pkt)) {
-          std::cerr << "Failed to push packet: closed queue";
+        const auto status = m_queue.push(pkt);
+        if (QueueStatus::Success != status) {
+          std::cerr << "Failed to push packet: "
+                    << PacketQueue::toString(status) << "\n";
           return DEC_ERROR;
         }
         break;
@@ -768,7 +809,20 @@ struct FfmpegDecodeFrame_Impl {
       return DEC_ERROR;
 
     // Don't pop the packet right away because decoder may not accept it.
-    std::shared_ptr<AVPacket> pkt = m_queue.peek().value_or(nullptr);
+    PacketPtr pkt = nullptr;
+    const auto status = m_queue.peek(pkt);
+    switch (status) {
+    // closed queue, not an error; keep flushing.
+    case QueueStatus::Closed:
+      break;
+    // empty queue, need more data.
+    case QueueStatus::Empty:
+      return DEC_MORE;
+    // got packet
+    default:
+      break;
+    }
+
     if (!pkt) {
       // Sentinel message received, time to close the queue.
       m_queue.close();
@@ -1067,7 +1121,7 @@ struct FfmpegDecodeFrame_Impl {
     m_frame->pts = AV_NOPTS_VALUE;
     m_state.m_over = false;
     m_queue.open();
-    while (m_queue.pop()) {
+    while (QueueStatus::Success == m_queue.pop()) {
     }
 
     /* Decode in loop until we reach desired frame.
@@ -1144,20 +1198,22 @@ TaskExecDetails DecodeFrame::GetSideData(AVFrameSideDataType data_type,
 }
 
 DecodeFrame* DecodeFrame::Make(const char* URL, NvDecoderClInterface& cli_iface,
-                               int gpu_id,
+                               int gpu_id, int pkt_queue_size,
                                std::shared_ptr<AVIOContext> p_io_ctx) {
-  return new DecodeFrame(URL, cli_iface, gpu_id, p_io_ctx);
+  return new DecodeFrame(URL, cli_iface, gpu_id, pkt_queue_size, p_io_ctx);
 }
 
 /* Don't mention any sync call in parent class constructor because GPU
  * acceleration is optional. Sync in decode method(s) instead.
  */
 DecodeFrame::DecodeFrame(const char* URL, NvDecoderClInterface& cli_iface,
-                         int gpu_id, std::shared_ptr<AVIOContext> p_io_ctx) {
+                         int gpu_id, int pkt_queue_size,
+                         std::shared_ptr<AVIOContext> p_io_ctx) {
   std::map<std::string, std::string> ffmpeg_options;
   cli_iface.GetOptions(ffmpeg_options);
 
-  pImpl = new FfmpegDecodeFrame_Impl(URL, ffmpeg_options, gpu_id, p_io_ctx);
+  pImpl = new FfmpegDecodeFrame_Impl(URL, ffmpeg_options, gpu_id,
+                                     pkt_queue_size, p_io_ctx);
 }
 
 DecodeFrame::~DecodeFrame() { delete pImpl; }
@@ -1178,7 +1234,10 @@ void DecodeFrame::Probe(const char* URL, NvDecoderClInterface& cli_iface,
 
   std::map<std::string, std::string> ffmpeg_options;
   cli_iface.GetOptions(ffmpeg_options);
-  FfmpegDecodeFrame_Impl dummy(URL, ffmpeg_options, -1, p_io_ctx, true);
+  // Huge packet queue just to make sure it won't return `full queue`.
+  const int pkt_queue_size = 250;
+  FfmpegDecodeFrame_Impl dummy(URL, ffmpeg_options, -1, pkt_queue_size,
+                               p_io_ctx, true);
 
   for (auto i = 0; i < dummy.GetNumStreams(); i++) {
     StreamParams params = {};
